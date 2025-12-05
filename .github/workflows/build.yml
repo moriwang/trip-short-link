@@ -1,0 +1,160 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-app:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+      
+      - name: Build Go Binary
+        run: go build -o trip-short-link main.go
+      
+      - name: Build Swift App
+        run: |
+          cd mac_app
+          swift build -c release
+      
+      - name: Generate Icon
+        run: swift generate_icon.swift
+      
+      - name: Create App Bundle
+        run: |
+          APP_NAME="Trip Shorts"
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF_NAME}"
+          else
+            VERSION="dev"
+          fi
+          echo "Building version: $VERSION"
+          
+          mkdir -p "$APP_NAME.app/Contents/MacOS"
+          mkdir -p "$APP_NAME.app/Contents/Resources"
+          
+          cp mac_app/.build/release/ShortLinkProxy "$APP_NAME.app/Contents/MacOS/TripShorts"
+          cp trip-short-link "$APP_NAME.app/Contents/MacOS/"
+          
+          cat > "$APP_NAME.app/Contents/Info.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleDisplayName</key>
+              <string>${APP_NAME}</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.trip.shorts</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleExecutable</key>
+              <string>TripShorts</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>14.0</string>
+              <key>LSUIElement</key>
+              <true/>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+          </dict>
+          </plist>
+          EOF
+          
+          cp AppIcon.icns "$APP_NAME.app/Contents/Resources/"
+          echo '{"success":true,"data":[]}' > "$APP_NAME.app/Contents/Resources/config.json"
+      
+      - name: Create ZIP
+        run: zip -r "Trip-Shorts-${{ github.ref_name || 'dev' }}.zip" "Trip Shorts.app"
+      
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Trip-Shorts-App
+          path: "Trip Shorts.app"
+      
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: "Trip-Shorts-*.zip"
+          tag_name: ${{ github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## 使用说明
+            
+            1. 下载并解压 ZIP 文件
+            2. 获取配置文件：
+               ```bash
+               curl http://offlineredirect.ops.ctripcorp.com/api/getAllRecords > "Trip Shorts.app/Contents/Resources/config.json"
+               ```
+            3. 双击 `Trip Shorts.app` 运行
+            4. 状态栏会出现 🩳 图标
+            
+            ## Docker 镜像
+            
+            ```bash
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ```
+            
+            ## 更新配置
+            
+            直接编辑 `Trip Shorts.app/Contents/Resources/config.json`，修改后自动生效。
+
+  build-docker:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
