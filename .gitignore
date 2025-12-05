@@ -1,0 +1,21 @@
+# Binaries
+proxy-server
+proxy-server-linux
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Config
+config.json
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/

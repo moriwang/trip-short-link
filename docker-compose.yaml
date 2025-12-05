@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  trip-short-link:
+    build: .
+    container_name: trip-short-link
+    ports:
+      - "8712:80" # Map host port to container port 80
+    environment:
+      - PORT=80
+      - CONFIG_FILE=/app/config.json
+    volumes:
+      # Mount local config.json to container
+      # Remove :ro to allow hot reload (send SIGUSR1 to container)
+      - ./config.json:/app/config.json:ro
+    restart: always
+    logging: # Optional: Configure logging for easier debugging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
