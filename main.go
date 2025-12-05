@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -146,7 +149,7 @@ func (ps *ProxyServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"status": "running",
 		"service": "Trip Short Link Proxy",
-		"version": "2.1.0-golang-file",
+		"version": "2.2.0-mixed-socks",
 		"uptime": uptime.String(),
 		"mappings": map[string]interface{}{
 			"total": mapSize,
@@ -235,15 +238,87 @@ func (ps *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, finalURL, http.StatusFound)
 }
 
+// --- Mixed Protocol (HTTP + SOCKS5) Support ---
+
+// ChannelListener implements net.Listener but accepts connections from a channel
+type ChannelListener struct {
+	addr    net.Addr
+	conns   chan net.Conn
+	closed  chan struct{}
+	closeMu sync.Mutex
+}
+
+func NewChannelListener(addr net.Addr) *ChannelListener {
+	return &ChannelListener{
+		addr:   addr,
+		conns:  make(chan net.Conn),
+		closed: make(chan struct{}),
+	}
+}
+
+func (l *ChannelListener) Accept() (net.Conn, error) {
+	select {
+	case c := <-l.conns:
+		return c, nil
+	case <-l.closed:
+		return nil, net.ErrClosed
+	}
+}
+
+func (l *ChannelListener) Close() error {
+	l.closeMu.Lock()
+	defer l.closeMu.Unlock()
+	select {
+	case <-l.closed:
+		return nil
+	default:
+		close(l.closed)
+		return nil
+	}
+}
+
+func (l *ChannelListener) Addr() net.Addr {
+	return l.addr
+}
+
+// PeekConn wraps a net.Conn to support peeking and unreading bytes
+type PeekConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func NewPeekConn(c net.Conn) *PeekConn {
+	return &PeekConn{
+		Conn: c,
+		r:    bufio.NewReader(c),
+	}
+}
+
+func (c *PeekConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+func (c *PeekConn) Peek(n int) ([]byte, error) {
+	return c.r.Peek(n)
+}
+
 func (ps *ProxyServer) Start() error {
 	// Load initial mappings from config file
 	if err := ps.loadMappingsFromFile(); err != nil {
 		log.Fatalf("Failed to load initial config: %v", err)
 	}
 
+	// Create the actual TCP listener
+	listener, err := net.Listen("tcp", ":"+ps.config.Port)
+	if err != nil {
+		return err
+	}
+	
+	// Create our virtual listener for the HTTP server
+	httpListener := NewChannelListener(listener.Addr())
+
 	// Create HTTP server
 	server := &http.Server{
-		Addr:    ":" + ps.config.Port,
 		Handler: http.HandlerFunc(ps.handleRequest),
 	}
 
@@ -251,34 +326,52 @@ func (ps *ProxyServer) Start() error {
 	shutdownChan := make(chan os.Signal, 1)
 	reloadChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
-	signal.Notify(reloadChan, syscall.SIGUSR1) // SIGUSR1 for reload
+	signal.Notify(reloadChan, syscall.SIGUSR1)
 
-	// Handle reload signal in background
+	// Handle reload signal
 	go func() {
 		for range reloadChan {
 			ps.reloadMappings()
 		}
 	}()
 
-	// Start server in goroutine
+	// Start connection dispatcher
 	go func() {
-		log.Printf("[%s] Trip Short Link Proxy service listening on port %s", time.Now().Format(time.RFC3339), ps.config.Port)
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				select {
+				case <-httpListener.closed:
+					return // Listener closed
+				default:
+					log.Printf("Accept error: %v", err)
+					continue
+				}
+			}
+			go ps.handleConnection(conn, httpListener)
+		}
+	}()
+
+	// Start HTTP server using our virtual listener
+	go func() {
+		log.Printf("[%s] Trip Short Link Proxy (SOCKS5+HTTP) listening on port %s", time.Now().Format(time.RFC3339), ps.config.Port)
 		log.Printf("[%s] Config file: %s", time.Now().Format(time.RFC3339), ps.config.ConfigFile)
-		log.Printf("[%s] Send SIGUSR1 to reload config: kill -USR1 %d", time.Now().Format(time.RFC3339), os.Getpid())
 		
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(httpListener); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed to start: %v", err)
 		}
 	}()
 
-	// Wait for shutdown signal
+	// Wait for shutdown
 	sig := <-shutdownChan
 	log.Printf("[%s] %s signal received: shutting down gracefully...", time.Now().Format(time.RFC3339), sig)
 
-	// Shutdown server with timeout
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
+	// Close the main listener first to stop accepting new raw connections
+	listener.Close()
+	
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Error during server shutdown: %v", err)
 		return err
@@ -288,13 +381,127 @@ func (ps *ProxyServer) Start() error {
 	return nil
 }
 
+// handleConnection identifies protocol and performs SOCKS handshake if needed
+func (ps *ProxyServer) handleConnection(rawConn net.Conn, httpListener *ChannelListener) {
+	// Wrap connection to allow peeking
+	conn := NewPeekConn(rawConn)
+	
+	// Peek first byte
+	head, err := conn.Peek(1)
+	if err != nil {
+		if err != io.EOF {
+			log.Printf("Peek error: %v", err)
+		}
+		conn.Close()
+		return
+	}
+
+	// Check for SOCKS5 (0x05)
+	if head[0] == 0x05 {
+		if err := handleSocks5Handshake(conn); err != nil {
+			log.Printf("SOCKS5 handshake failed: %v", err)
+			conn.Close()
+			return
+		}
+		// After successful handshake, the client will send the actual HTTP request.
+		// We pass the connection (which is now positioned at the start of HTTP request) to the HTTP server.
+	} 
+	
+	// Pass to HTTP server (either it was HTTP all along, or we unwrapped SOCKS5)
+	// We need to be careful not to block if the server is shutting down
+	select {
+	case httpListener.conns <- conn:
+	case <-httpListener.closed:
+		conn.Close()
+	}
+}
+
+// handleSocks5Handshake performs a minimal SOCKS5 server handshake
+func handleSocks5Handshake(conn io.ReadWriter) error {
+	// 1. Client Greeting
+	// Version (1) + NMethods (1) + Methods (N)
+	buf := make([]byte, 258)
+	// Read Version and NMethods
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return fmt.Errorf("read greeting header: %w", err)
+	}
+	if buf[0] != 5 {
+		return fmt.Errorf("unsupported version: %d", buf[0])
+	}
+	nMethods := int(buf[1])
+	// Read Methods
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+		return fmt.Errorf("read methods: %w", err)
+	}
+
+	// 2. Server Choice
+	// Version (1) + Method (1)
+	// We choose No Authentication (0x00)
+	if _, err := conn.Write([]byte{0x05, 0x00}); err != nil {
+		return fmt.Errorf("write choice: %w", err)
+	}
+
+	// 3. Client Request
+	// Ver(1) + Cmd(1) + Rsv(1) + Atyp(1) + DstAddr(?) + DstPort(2)
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return fmt.Errorf("read request header: %w", err)
+	}
+	
+	cmd := buf[1]
+	if cmd != 1 { // CONNECT
+		return fmt.Errorf("unsupported command: %d", cmd)
+	}
+	
+atyp := buf[3]
+	switch atyp {
+	case 1: // IPv4
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+			return err
+		}
+	case 3: // Domain
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return err
+		}
+		addrLen := int(buf[0])
+		if _, err := io.ReadFull(conn, buf[:addrLen]); err != nil {
+			return err
+		}
+	case 4: // IPv6
+		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported address type: %d", atyp)
+	}
+	
+	// Read Port
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return err
+	}
+
+	// 4. Server Reply
+	// Ver(1) + Rep(1) + Rsv(1) + Atyp(1) + BndAddr(?) + BndPort(2)
+	// Rep: 0x00 (Succeeded)
+	// We just return 0.0.0.0:0 as bound address
+	response := []byte{
+		0x05, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+	}
+	if _, err := conn.Write(response); err != nil {
+		return fmt.Errorf("write reply: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	startTime = time.Now()
 	config := loadConfig()
+	
 	proxy := NewProxyServer(config)
 	
 	if err := proxy.Start(); err != nil {
 		log.Fatalf("Failed to run proxy server: %v", err)
 	}
 }
-

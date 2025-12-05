@@ -9,6 +9,7 @@ proxy-server-linux
 
 # Config
 config.json
+singbox.json
 
 # Logs
 *.log
@@ -19,3 +20,5 @@ config.json
 # IDEs
 .idea/
 .vscode/
+
+trip-short-link
