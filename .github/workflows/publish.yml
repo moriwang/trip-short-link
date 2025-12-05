@@ -2,9 +2,9 @@ name: Docker Image CI/CD
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 env:
   # 使用 GitHub 容器仓库
