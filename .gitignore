@@ -1,15 +1,17 @@
 # Binaries
-proxy-server
-proxy-server-linux
+trip-short-link
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
 
-# Config
+# Config (user-specific)
 config.json
 singbox.json
+
+# Build artifacts
+.build/
+Trip Shorts.app/
 
 # Logs
 *.log
@@ -20,5 +22,3 @@ singbox.json
 # IDEs
 .idea/
 .vscode/
-
-trip-short-link

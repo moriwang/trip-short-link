@@ -54,6 +54,8 @@ type ProxyServer struct {
 	shortLinkMap map[string]string
 	mapMutex     sync.RWMutex
 	lastSyncTime time.Time
+	requestCount uint64
+	countMutex   sync.RWMutex
 }
 
 func loadConfig() Config {
@@ -142,14 +144,20 @@ func (ps *ProxyServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	lastSync := ps.lastSyncTime
 	ps.mapMutex.RUnlock()
 
+	// Get request count
+	ps.countMutex.RLock()
+	requestCount := ps.requestCount
+	ps.countMutex.RUnlock()
+
 	// Calculate uptime
 	uptime := time.Since(startTime)
 	
 	// Build response
 	response := map[string]interface{}{
 		"status": "running",
-		"service": "Trip Short Link Proxy",
-		"version": "2.2.0-mixed-socks",
+		"service": "Trip Shorts Proxy",
+		"version": "2.3.0",
+		"request_count": requestCount,
 		"uptime": uptime.String(),
 		"mappings": map[string]interface{}{
 			"total": mapSize,
@@ -185,6 +193,25 @@ func (ps *ProxyServer) handleCheck(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// handlePac serves the PAC file dynamically
+func (ps *ProxyServer) handlePac(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
+	
+	// Determine the port currently running on
+	port := ps.config.Port
+	
+	// Simple PAC that directs non-dot hosts to us, others DIRECT
+	pacTemplate := `function FindProxyForURL(url, host) {
+    var safeHost = host.toLowerCase();
+    // If it's a plain hostname (no dots), use our proxy
+    if (safeHost.indexOf('.') === -1) {
+        return "SOCKS5 127.0.0.1:%s; SOCKS 127.0.0.1:%s; DIRECT";
+    }
+    return "DIRECT";
+}`
+	fmt.Fprintf(w, pacTemplate, port, port)
+}
+
 // handleRequest processes HTTP proxy requests
 func (ps *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Health check endpoint
@@ -192,6 +219,17 @@ func (ps *ProxyServer) handleRequest(w http.ResponseWriter, r *http.Request) {
 		ps.handleCheck(w, r)
 		return
 	}
+
+	// PAC file endpoint
+	if r.URL.Path == "/proxy.pac" {
+		ps.handlePac(w, r)
+		return
+	}
+
+	// Increment request counter (excluding health checks and PAC)
+	ps.countMutex.Lock()
+	ps.requestCount++
+	ps.countMutex.Unlock()
 
 	// Extract hostname from Host header
 	host := r.Host

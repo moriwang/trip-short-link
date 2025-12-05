@@ -5,7 +5,7 @@ services:
     build: .
     container_name: trip-short-link
     ports:
-      - "8712:80" # Map host port to container port 80
+      - "8172:80" # Map host port to container port 80
     environment:
       - PORT=80
       - CONFIG_FILE=/app/config.json

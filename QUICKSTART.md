@@ -11,10 +11,10 @@
 
 ### 1. 准备配置文件
 
-如果还没有 `config.json`，可以从 API 导出：
+如果还没有 `config.json`，可以登入后访问 API 导出：
 
-```bash
-curl http://offlineredirect.ops.ctripcorp.com/api/getAllRecords > config.json
+```
+http://offlineredirect.ops.ctripcorp.com/api/getAllRecords > config.json
 ```
 
 ### 2. 启动服务
