@@ -1,5 +1,6 @@
 # Build stage
-FROM golang:1.21-alpine AS builder
+# Use the host platform for building to maximize speed (avoiding QEMU for compilation)
+FROM --platform=$BUILDPLATFORM golang:1.21-alpine AS builder
 
 # Set working directory
 WORKDIR /build
@@ -13,9 +14,13 @@ RUN go mod download
 # Copy source code
 COPY main.go ./
 
+# Arguments automatically provided by Docker Buildx
+ARG TARGETOS
+ARG TARGETARCH
+
 # Build the application with optimization flags
-# -ldflags="-s -w" removes symbol table and debug info, reducing binary size by ~30%
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-s -w" -o proxy-server .
+# We explicitly use the target OS and architecture for cross-compilation
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -a -installsuffix cgo -ldflags="-s -w" -o proxy-server .
 
 # Runtime stage
 FROM alpine:latest
@@ -33,4 +38,3 @@ EXPOSE 80
 
 # Run the application
 CMD ["./proxy-server"]
-
